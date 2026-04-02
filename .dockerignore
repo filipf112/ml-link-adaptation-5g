@@ -1,0 +1,10 @@
+# Don't copy large generated files into the Docker image
+*.csv
+*.png
+__pycache__/
+*.pyc
+.git/
+.gitmodules
+sionna/
+.env
+venv/
