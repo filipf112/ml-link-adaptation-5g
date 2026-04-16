@@ -29,9 +29,17 @@ Complex ensemble models violate the strict microsecond inference limits required
 
 ## III. Repository Structure
 
-*Repository structural layout is under active development. Current tracking involves submodule integration for the physical layer baseline.*
+```
+ml-link-adaptation-5g/
+├── sionna/                         # Git submodule — NVIDIA Sionna PHY simulator
+├── generate_v2_dataset.py          # 3GPP TDL channel simulation & dataset generation
+├── train_real_ml_model.py          # Model training pipeline (ordinal regression + distillation)
+├── benchmark_la_approaches.py      # Offline benchmarking: AI vs OLLA vs Oracle
+├── online_la_simulator.py          # Online closed-loop LA simulation with HARQ feedback
+├── test_ml_link_adaptation.cpp     # C++ unit test for the exported decision tree
+└── README.md
+```
 
-- `sionna/` : Git submodule linking the upstream NVIDIA Sionna repository utilized for PHY simulation pipelines.
 
 ## IV. Prerequisites and Dependencies
 

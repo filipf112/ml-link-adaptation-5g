@@ -17,11 +17,19 @@ New CSV columns:
 """
 
 import argparse
+import gc
 import os
+import time
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 import tensorflow as tf
+
+# Prevent TF from pre-allocating all GPU memory
+gpus = tf.config.list_physical_devices('GPU')
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
+
 from sionna.phy.mapping import Mapper, Demapper, BinarySource
 from sionna.phy.ofdm import (
     ResourceGrid, ResourceGridMapper,
@@ -52,6 +60,14 @@ NR_MCS_TABLE = [
 
 HARQ_MAX_ROUNDS = 4
 HARQ_RTT_SLOTS = 4
+
+CSV_COLUMNS = [
+    "SINR_dB", "SIR_dB", "Channel", "Speed_kmph",
+    "MCS_Index", "Modulation_Qm", "Code_Rate",
+    "Was_Success", "HARQ_Tx_Rounds", "Actual_Throughput", "Time_Index",
+    "Num_Tx_Ant", "Num_Streams", "Carrier_GHz",
+    "SIR_Base_dB", "SIR_Effective_dB",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -324,38 +340,40 @@ def simulate_harq_drop(model, batch_size, snr_db, sir_eff_db):
 # ---------------------------------------------------------------------------
 
 def build_sweep_config(quick: bool):
-    """Build the full parameter sweep configuration."""
+    """Build the parameter sweep configuration.
+
+    Full mode is sized for IEEE-grade coverage while keeping generation
+    feasible (~1-2 hours on a single GPU):
+      - 2 dB SNR steps (standard for BLER curve interpolation)
+      - 3 speeds  (pedestrian/urban/highway per 3GPP TR 38.901)
+      - 3 SIR    (clean / moderate / heavy interference)
+      - 3 channels (flat NLOS / rich-scatter NLOS / LOS)
+      - SISO + 2×2 MIMO, FR1 + FR2
+    """
 
     if quick:
-        snr_range = np.arange(-5, 31, 3.0)         # 12 points
+        snr_range = np.arange(-5, 31, 4.0)         # 9 points
         ue_speeds = [3.0, 120.0]                     # 2 speeds
         sir_levels = [30.0, 7.0]                     # 2 SIR levels
         mimo_configs = [1]                           # SISO only for quick
         freq_ranges = ["FR1"]                        # FR1 only for quick
         batch_size = 50
-    else:
-        snr_range = np.arange(-5, 31, 1.0)          # 36 points
-        ue_speeds = [3.0, 10.0, 30.0, 60.0, 120.0]  # 5 speeds
-        sir_levels = [30.0, 20.0, 15.0, 7.0, 3.0]   # 5 SIR levels
-        mimo_configs = [1, 2]                        # SISO + 2×2 MIMO
-        freq_ranges = ["FR1", "FR2"]                 # Both bands
-        batch_size = 100
-
-    # Channel configurations:  (name, family, model, delay_spread)
-    channel_configs = [
-        ("TDL-A", "tdl", "A", 30e-9),
-        ("TDL-B", "tdl", "B", 300e-9),
-        ("TDL-C", "tdl", "C", 1000e-9),
-        ("CDL-A", "cdl", "A", 300e-9),    # NLOS clustered
-        ("CDL-D", "cdl", "D", 30e-9),     # LOS
-    ]
-
-    if quick:
-        # Reduce to 3 channels for quick mode
         channel_configs = [
             ("TDL-A", "tdl", "A", 30e-9),
             ("TDL-C", "tdl", "C", 1000e-9),
             ("CDL-D", "cdl", "D", 30e-9),
+        ]
+    else:
+        snr_range = np.arange(-5, 31, 2.0)          # 18 points (2 dB steps)
+        ue_speeds = [3.0, 30.0, 120.0]               # 3 speeds
+        sir_levels = [30.0, 10.0, 3.0]               # 3 SIR levels
+        mimo_configs = [1, 2]                        # SISO + 2×2 MIMO
+        freq_ranges = ["FR1", "FR2"]                 # Both bands
+        batch_size = 200                             # Larger for GPU efficiency
+        channel_configs = [
+            ("TDL-A", "tdl", "A", 30e-9),           # Flat fading NLOS
+            ("TDL-C", "tdl", "C", 1000e-9),          # Rich-scatter NLOS
+            ("CDL-D", "cdl", "D", 30e-9),            # LOS
         ]
 
     return {
@@ -371,8 +389,18 @@ def build_sweep_config(quick: bool):
 
 
 # ---------------------------------------------------------------------------
-# Main generation loop
+# Combo key for checkpointing
 # ---------------------------------------------------------------------------
+
+def combo_key(ch_name, freq_range, num_streams, speed, mcs_idx):
+    return f"{ch_name}|{freq_range}|{num_streams}|{speed}|{mcs_idx}"
+
+
+# ---------------------------------------------------------------------------
+# Main generation loop — with checkpointing and resume
+# ---------------------------------------------------------------------------
+
+OUT_PATH = "sionna_v2_dataset.csv"
 
 def generate_v2_dataset(args):
     cfg = build_sweep_config(args.quick)
@@ -385,37 +413,47 @@ def generate_v2_dataset(args):
           f"Freq ranges: {cfg['freq_ranges']}")
     print(f"    Channels: {[c[0] for c in cfg['channel_configs']]}")
 
+    # --- Resume support: load existing progress ---
+    completed_combos = set()
+    existing_rows = 0
+    if os.path.exists(OUT_PATH) and not args.quick:
+        try:
+            df_existing = pd.read_csv(OUT_PATH)
+            existing_rows = len(df_existing)
+            for _, row in df_existing.drop_duplicates(
+                    subset=["Channel", "Carrier_GHz", "Num_Streams",
+                            "Speed_kmph", "MCS_Index"]).iterrows():
+                fr = "FR2" if row["Carrier_GHz"] > 10 else "FR1"
+                key = combo_key(
+                    row["Channel"], fr, int(row["Num_Streams"]),
+                    row["Speed_kmph"], int(row["MCS_Index"]))
+                completed_combos.add(key)
+            print(f"\n    *** RESUMING: found {existing_rows:,} rows, "
+                  f"{len(completed_combos)} combos already done ***\n")
+            del df_existing
+        except Exception:
+            completed_combos = set()
+
+    # RNG must be deterministic — advance past completed combos
     rng = np.random.default_rng(42)
 
-    columns = {
-        # Existing columns
-        "SINR_dB": [], "SIR_dB": [], "Channel": [], "Speed_kmph": [],
-        "MCS_Index": [], "Modulation_Qm": [], "Code_Rate": [],
-        "Was_Success": [], "HARQ_Tx_Rounds": [], "Actual_Throughput": [],
-        "Time_Index": [],
-        # New V2 columns
-        "Num_Tx_Ant": [],         # Gap 3: MIMO
-        "Num_Streams": [],        # Gap 3: MIMO layers
-        "Carrier_GHz": [],        # Gap 7: FR1 vs FR2
-        "SIR_Base_dB": [],        # Gap 6: nominal SIR
-        "SIR_Effective_dB": [],   # Gap 6: actual SIR after jitter
-    }
-    global_time_idx = 0
     total_combos = (
         len(cfg["channel_configs"]) * len(cfg["freq_ranges"])
         * len(cfg["mimo_configs"]) * len(cfg["ue_speeds"])
         * len(NR_MCS_TABLE)
     )
     combo_idx = 0
+    global_time_idx = existing_rows
+    combos_skipped = 0
+    t_start = time.time()
 
     for ch_name, ch_family, ch_model, ds in cfg["channel_configs"]:
         for freq_range in cfg["freq_ranges"]:
             carrier_ghz = RG_CONFIGS[freq_range]["carrier_frequency"] / 1e9
 
-            # FR2 at mmWave uses shorter delay spreads
             effective_ds = ds
             if freq_range == "FR2":
-                effective_ds = min(ds, 100e-9)  # mmWave delay spreads ≤ 100 ns
+                effective_ds = min(ds, 100e-9)
 
             for num_streams in cfg["mimo_configs"]:
                 for speed in cfg["ue_speeds"]:
@@ -423,11 +461,33 @@ def generate_v2_dataset(args):
                         combo_idx += 1
                         code_rate = rate_x1024 / 1024.0
 
+                        key = combo_key(ch_name, freq_range, num_streams,
+                                        speed, mcs_idx)
+
+                        # We must always advance the RNG to stay deterministic
+                        # even when skipping (one draw per SNR×SIR point)
+                        n_sir_draws = (len(cfg["snr_range"])
+                                       * len(cfg["sir_levels"]))
+
+                        if key in completed_combos:
+                            # Advance RNG past this combo's jitter draws
+                            rng.normal(0, cfg["sir_jitter_sigma_db"],
+                                       n_sir_draws)
+                            combos_skipped += 1
+                            continue
+
+                        elapsed = time.time() - t_start
+                        done = combo_idx - combos_skipped
+                        eta_s = (elapsed / max(done - len(completed_combos), 1)
+                                 * (total_combos - combo_idx)) if done > len(completed_combos) else 0
+
                         print(f"  [{combo_idx}/{total_combos}] "
                               f"{ch_name} | {freq_range} | "
                               f"{num_streams}×{num_streams} MIMO | "
-                              f"{speed} km/h | MCS {mcs_idx}")
+                              f"{speed} km/h | MCS {mcs_idx}"
+                              f"  (ETA: {eta_s/60:.0f} min)")
 
+                        # --- Build model ---
                         try:
                             if ch_family == "tdl":
                                 model = TDLLinkSimulator(
@@ -439,7 +499,7 @@ def generate_v2_dataset(args):
                                     num_streams=num_streams,
                                     freq_range=freq_range,
                                 )
-                            else:  # cdl
+                            else:
                                 model = CDLLinkSimulator(
                                     num_bits_per_symbol=qm,
                                     code_rate=code_rate,
@@ -451,88 +511,107 @@ def generate_v2_dataset(args):
                                 )
                         except Exception as exc:
                             print(f"    [SKIP] {exc}")
+                            rng.normal(0, cfg["sir_jitter_sigma_db"],
+                                       n_sir_draws)
                             continue
+
+                        # --- Collect rows for this combo ---
+                        combo_rows = []
 
                         for snr in cfg["snr_range"]:
                             for sir_base in cfg["sir_levels"]:
-                                # Gap 6: stochastic SIR jitter
                                 sir_jitter = rng.normal(
-                                    0, cfg["sir_jitter_sigma_db"],
-                                )
+                                    0, cfg["sir_jitter_sigma_db"])
                                 sir_eff = sir_base + sir_jitter
 
-                                # Recorded SINR (what gNB estimates)
                                 sinr_lin = 1.0 / (
-                                    10**(-snr/10) + 10**(-sir_eff/10)
-                                )
+                                    10**(-snr/10) + 10**(-sir_eff/10))
                                 sinr_db = 10.0 * np.log10(sinr_lin)
 
+                                # Adaptive batch for MIMO
                                 bs = cfg["batch_size"]
+                                if num_streams > 1:
+                                    bs = max(
+                                        bs // (num_streams
+                                               * max(qm // 2, 1)),
+                                        10)
+
                                 try:
                                     success, rounds, thr = (
                                         simulate_harq_drop(
-                                            model, bs, snr, sir_eff,
-                                        )
-                                    )
+                                            model, bs, snr, sir_eff))
                                 except Exception as exc:
-                                    print(f"    [SIM FAIL] SNR={snr}: {exc}")
-                                    continue
+                                    if "Out of memory" in str(exc):
+                                        bs = max(bs // 2, 10)
+                                        tf.keras.backend.clear_session()
+                                        gc.collect()
+                                        try:
+                                            success, rounds, thr = (
+                                                simulate_harq_drop(
+                                                    model, bs, snr, sir_eff))
+                                        except Exception:
+                                            print(f"    [OOM] SNR={snr} "
+                                                  f"bs={bs}")
+                                            continue
+                                    else:
+                                        print(f"    [FAIL] SNR={snr}: "
+                                              f"{exc}")
+                                        continue
 
-                                n = bs
-                                columns["SINR_dB"].extend(
-                                    np.full(n, sinr_db))
-                                columns["SIR_dB"].extend(
-                                    np.full(n, sir_eff))
-                                columns["Channel"].extend(
-                                    np.full(n, ch_name))
-                                columns["Speed_kmph"].extend(
-                                    np.full(n, speed))
-                                columns["MCS_Index"].extend(
-                                    np.full(n, mcs_idx))
-                                columns["Modulation_Qm"].extend(
-                                    np.full(n, qm))
-                                columns["Code_Rate"].extend(
-                                    np.full(n, code_rate))
-                                columns["Was_Success"].extend(success)
-                                columns["HARQ_Tx_Rounds"].extend(rounds)
-                                columns["Actual_Throughput"].extend(thr)
-                                columns["Time_Index"].extend(
-                                    np.arange(
-                                        global_time_idx,
-                                        global_time_idx + n,
-                                    )
-                                )
-                                # V2 columns
-                                columns["Num_Tx_Ant"].extend(
-                                    np.full(n, num_streams))
-                                columns["Num_Streams"].extend(
-                                    np.full(n, num_streams))
-                                columns["Carrier_GHz"].extend(
-                                    np.full(n, carrier_ghz))
-                                columns["SIR_Base_dB"].extend(
-                                    np.full(n, sir_base))
-                                columns["SIR_Effective_dB"].extend(
-                                    np.full(n, sir_eff))
-
+                                n = len(success)
+                                for i in range(n):
+                                    combo_rows.append({
+                                        "SINR_dB": sinr_db,
+                                        "SIR_dB": sir_eff,
+                                        "Channel": ch_name,
+                                        "Speed_kmph": speed,
+                                        "MCS_Index": mcs_idx,
+                                        "Modulation_Qm": qm,
+                                        "Code_Rate": code_rate,
+                                        "Was_Success": success[i],
+                                        "HARQ_Tx_Rounds": rounds[i],
+                                        "Actual_Throughput": thr[i],
+                                        "Time_Index": global_time_idx + i,
+                                        "Num_Tx_Ant": num_streams,
+                                        "Num_Streams": num_streams,
+                                        "Carrier_GHz": carrier_ghz,
+                                        "SIR_Base_dB": sir_base,
+                                        "SIR_Effective_dB": sir_eff,
+                                    })
                                 global_time_idx += n
 
+                        # --- Checkpoint: append this combo to CSV ---
+                        if combo_rows:
+                            df_chunk = pd.DataFrame(combo_rows,
+                                                    columns=CSV_COLUMNS)
+                            write_header = not os.path.exists(OUT_PATH)
+                            df_chunk.to_csv(OUT_PATH, mode='a',
+                                            header=write_header,
+                                            index=False)
+                            print(f"    ✓ {len(combo_rows):,} rows saved "
+                                  f"({combo_idx}/{total_combos})")
+
+                        # --- Aggressive cleanup ---
                         del model
+                        if combo_rows:
+                            del combo_rows, df_chunk
                         tf.keras.backend.clear_session()
+                        gc.collect()
 
-    df = pd.DataFrame(columns)
-    out_path = "sionna_v2_dataset.csv"
-    df.to_csv(out_path, index=False)
-    print(f"\n✓ Done. Saved {out_path}  ({len(df):,} rows)")
-
-    # Print summary statistics
-    print("\n=== Dataset Summary ===")
-    print(f"Total rows: {len(df):,}")
-    print(f"Channels: {df['Channel'].unique().tolist()}")
-    print(f"Carriers: {df['Carrier_GHz'].unique().tolist()} GHz")
-    print(f"MIMO configs: {df['Num_Streams'].unique().tolist()}")
-    print(f"SINR range: [{df['SINR_dB'].min():.1f}, "
-          f"{df['SINR_dB'].max():.1f}] dB")
-    print(f"Mean success rate: {df['Was_Success'].mean():.3f}")
+    # --- Final summary ---
+    if os.path.exists(OUT_PATH):
+        df = pd.read_csv(OUT_PATH)
+        print(f"\n✓ Done. {OUT_PATH}  ({len(df):,} rows)")
+        print(f"\n=== Dataset Summary ===")
+        print(f"Total rows: {len(df):,}")
+        print(f"Channels: {df['Channel'].unique().tolist()}")
+        print(f"Carriers: {df['Carrier_GHz'].unique().tolist()} GHz")
+        print(f"MIMO configs: {df['Num_Streams'].unique().tolist()}")
+        print(f"SINR range: [{df['SINR_dB'].min():.1f}, "
+              f"{df['SINR_dB'].max():.1f}] dB")
+        print(f"Mean success rate: {df['Was_Success'].mean():.3f}")
+        elapsed = time.time() - t_start
+        print(f"Wall time: {elapsed/60:.1f} min")
 
 
 if __name__ == "__main__":

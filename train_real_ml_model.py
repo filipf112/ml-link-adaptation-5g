@@ -703,7 +703,9 @@ def export_tree_to_cpp(clf, feature_cols, mcs_indices, out_path):
     cpp.extend([
         "int select_mcs(double measured_sinr_db,",
         "               double measured_speed_kmph,",
-        "               int    channel_ordinal,",
+        "               double channel_ordinal,",
+        "               double carrier_band,",
+        "               double num_antennas,",
         "               double bler_target_log10,",
         "               OllaState& state,",
         "               bool   last_was_ack) {",
@@ -726,7 +728,8 @@ def export_tree_to_cpp(clf, feature_cols, mcs_indices, out_path):
         "    }",
         "",
         "    int base = select_mcs_base(measured_sinr_db, measured_speed_kmph,",
-        "                               channel_ordinal, bler_target_log10);",
+        "                               channel_ordinal, carrier_band,",
+        "                               num_antennas, bler_target_log10);",
         "    int adjusted = base + state.mcs_offset;",
         f"    adjusted = std::clamp(adjusted, VALID_MCS[0], VALID_MCS[N_MCS-1]);",
         "    return nearest_valid_mcs(adjusted);",
@@ -812,6 +815,13 @@ def train_and_evaluate():
     df = normalize_dataset(df, version)
     print(f"   Dataset version: {version}, rows: {len(df):,}")
 
+    # Quantize SINR_dB to 1 dB bins.  The SIR jitter in V2 generation is
+    # drawn independently per-MCS, so each MCS gets a slightly different
+    # SINR_dB even at the same operating point.  Without binning, each
+    # context has only 1 MCS → trivial "optimal" labels → random accuracy.
+    # 1 dB bins group all 9 MCS at similar operating points together.
+    df["SINR_dB"] = df["SINR_dB"].round(0)
+
     rng = np.random.default_rng(RANDOM_SEED)
 
     # ---- 2. Build labels ----
@@ -849,6 +859,10 @@ def train_and_evaluate():
         optimal_embb["Channel"].astype(str)
         + "_" + optimal_embb["Speed_kmph"].astype(str)
     )
+    if "Num_Streams" in optimal_embb.columns:
+        groups = groups + "_" + optimal_embb["Num_Streams"].astype(str)
+    if "Carrier_GHz" in optimal_embb.columns:
+        groups = groups + "_" + optimal_embb["Carrier_GHz"].astype(str)
     splitter = GroupShuffleSplit(
         n_splits=1, test_size=0.25, random_state=RANDOM_SEED,
     )

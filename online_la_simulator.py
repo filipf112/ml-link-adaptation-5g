@@ -34,6 +34,11 @@ from scipy.interpolate import interp1d
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import accuracy_score
 
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -283,14 +288,91 @@ class OfflineGBMAgent:
         self.feature_cols = feature_cols
 
     def select_mcs(self, measured_sinr, measured_speed=0, channel_ord=0,
-                   **kw):
-        x = pd.DataFrame(
-            [[measured_sinr, measured_speed, channel_ord]],
-            columns=self.feature_cols)
+                   carrier_band=0, num_antennas=1, **kw):
+        feats = [measured_sinr, measured_speed, channel_ord]
+        if len(self.feature_cols) > 3:
+            feats += [carrier_band, num_antennas]
+        x = pd.DataFrame([feats], columns=self.feature_cols)
         return int(self.policy.predict(x)[0])
 
     def update(self, was_ack, **kw):
         pass  # No adaptation
+
+
+class DNNClassifierNet(nn.Module):
+    """MLP classifier for MCS selection."""
+    def __init__(self, n_features, n_classes):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_features, 128), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(128, 128), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(128, 64), nn.ReLU(),
+            nn.Linear(64, n_classes),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+
+class OfflineDNNAgent:
+    """Pre-trained DNN classifier without online adaptation."""
+    def __init__(self, model, feature_cols, mcs_list):
+        self.name = "Offline DNN"
+        self.model = model
+        self.feature_cols = feature_cols
+        self.mcs_list = mcs_list
+        self.model.eval()
+
+    def select_mcs(self, measured_sinr, measured_speed=0, channel_ord=0,
+                   carrier_band=0, num_antennas=1, **kw):
+        feats = [measured_sinr, measured_speed, channel_ord]
+        if len(self.feature_cols) > 3:
+            feats += [carrier_band, num_antennas]
+        x = torch.FloatTensor([feats])
+        with torch.no_grad():
+            logits = self.model(x)
+        idx = logits.argmax(dim=1).item()
+        return self.mcs_list[idx]
+
+    def update(self, was_ack, **kw):
+        pass
+
+
+class DNNWithOLLAAgent:
+    """DNN classifier + OLLA offset adaptation."""
+    def __init__(self, model, feature_cols, mcs_list,
+                 bler_target=0.10, step_up_db=0.1):
+        self.name = "DNN + OLLA"
+        self.model = model
+        self.feature_cols = feature_cols
+        self.mcs_list = mcs_list
+        self.model.eval()
+        self.offset_db = 0.0
+        self.step_up = step_up_db
+        self.step_down = step_up_db * (1 - bler_target) / bler_target
+        self.consecutive_nack = 0
+
+    def select_mcs(self, measured_sinr, measured_speed=0, channel_ord=0,
+                   carrier_band=0, num_antennas=1, **kw):
+        if self.consecutive_nack > 50:
+            return NR_MCS_INDICES[0]
+        adjusted = measured_sinr + self.offset_db
+        feats = [adjusted, measured_speed, channel_ord]
+        if len(self.feature_cols) > 3:
+            feats += [carrier_band, num_antennas]
+        x = torch.FloatTensor([feats])
+        with torch.no_grad():
+            logits = self.model(x)
+        idx = logits.argmax(dim=1).item()
+        return self.mcs_list[idx]
+
+    def update(self, was_ack, **kw):
+        if was_ack:
+            self.offset_db += self.step_up
+            self.consecutive_nack = 0
+        else:
+            self.offset_db -= self.step_down
+            self.consecutive_nack += 1
+        self.offset_db = np.clip(self.offset_db, -6.0, 6.0)
 
 
 class GBMWithOLLAAgent:
@@ -314,16 +396,17 @@ class GBMWithOLLAAgent:
         self.consecutive_nack = 0
 
     def select_mcs(self, measured_sinr, measured_speed=0, channel_ord=0,
-                   **kw):
+                   carrier_band=0, num_antennas=1, **kw):
         # Kill switch: 50 consecutive NACKs → fallback
         if self.consecutive_nack > 50:
             return NR_MCS_INDICES[0]
 
         # GBM base prediction with offset-adjusted SINR
         adjusted_sinr = measured_sinr + self.offset_db
-        x = pd.DataFrame(
-            [[adjusted_sinr, measured_speed, channel_ord]],
-            columns=self.feature_cols)
+        feats = [adjusted_sinr, measured_speed, channel_ord]
+        if len(self.feature_cols) > 3:
+            feats += [carrier_band, num_antennas]
+        x = pd.DataFrame([feats], columns=self.feature_cols)
         return int(self.policy.predict(x)[0])
 
     def update(self, was_ack, **kw):
@@ -387,7 +470,8 @@ class ClosedLoopSimulator:
         self.rng = rng
 
     def run_scenario(self, agents, sinr_trace_true, sinr_trace_measured,
-                     channel, speed, measured_speed=None):
+                     channel, speed, measured_speed=None,
+                     carrier_band=0.0, num_antennas=1.0):
         """Run all agents over the same SINR trace.
 
         Returns dict of {agent_name: {throughput, bler, mcs_selected, ...}}
@@ -417,6 +501,8 @@ class ClosedLoopSimulator:
                     measured_sinr=sinr_trace_measured[t],
                     measured_speed=measured_speed,
                     channel_ord=ch_ord,
+                    carrier_band=carrier_band,
+                    num_antennas=num_antennas,
                 )
                 mcs_history[t] = mcs
 
@@ -460,7 +546,8 @@ class ClosedLoopSimulator:
 # 7. Scenario Definitions
 # ============================================================================
 
-def run_all_scenarios(bler_lookup, gbm_policy, feature_cols, rng):
+def run_all_scenarios(bler_lookup, gbm_policy, feature_cols, rng,
+                     dnn_model=None):
     """Run 3 scenarios comparing all agents."""
     trace_gen = SINRTraceGenerator(rng)
     sim = ClosedLoopSimulator(bler_lookup, rng)
@@ -479,6 +566,11 @@ def run_all_scenarios(bler_lookup, gbm_policy, feature_cols, rng):
         OfflineGBMAgent(gbm_policy, feature_cols),
         GBMWithOLLAAgent(gbm_policy, feature_cols, bler_target=0.10),
     ]
+    if dnn_model is not None:
+        agents.extend([
+            OfflineDNNAgent(dnn_model, feature_cols, NR_MCS_INDICES),
+            DNNWithOLLAAgent(dnn_model, feature_cols, NR_MCS_INDICES),
+        ])
 
     results = sim.run_scenario(
         agents, true_sinr, meas_sinr,
@@ -508,6 +600,11 @@ def run_all_scenarios(bler_lookup, gbm_policy, feature_cols, rng):
         OfflineGBMAgent(gbm_policy, feature_cols),
         GBMWithOLLAAgent(gbm_policy, feature_cols, bler_target=0.10),
     ]
+    if dnn_model is not None:
+        agents.extend([
+            OfflineDNNAgent(dnn_model, feature_cols, NR_MCS_INDICES),
+            DNNWithOLLAAgent(dnn_model, feature_cols, NR_MCS_INDICES),
+        ])
 
     results = sim.run_scenario(
         agents, true_sinr, meas_sinr,
@@ -531,13 +628,17 @@ def run_all_scenarios(bler_lookup, gbm_policy, feature_cols, rng):
     true_sinr = np.concatenate([true_sinr_slow, true_sinr_fast])
     meas_sinr = np.concatenate([meas_sinr_slow, meas_sinr_fast])
 
-    # Agents need fresh state for scenario 3
     agents = [
         StaticLUTAgent(),
         OLLAAgent(bler_target=0.10),
         OfflineGBMAgent(gbm_policy, feature_cols),
         GBMWithOLLAAgent(gbm_policy, feature_cols, bler_target=0.10),
     ]
+    if dnn_model is not None:
+        agents.extend([
+            OfflineDNNAgent(dnn_model, feature_cols, NR_MCS_INDICES),
+            DNNWithOLLAAgent(dnn_model, feature_cols, NR_MCS_INDICES),
+        ])
 
     results = sim.run_scenario(
         agents, true_sinr, meas_sinr,
@@ -568,6 +669,8 @@ def plot_scenario_results(all_scenarios, output_path="online_la_results.png"):
         "OLLA": "#f0883e",
         "Offline GBM": "#58a6ff",
         "GBM + OLLA": "#3fb950",
+        "Offline DNN": "#bc8cff",
+        "DNN + OLLA": "#ff7b72",
     }
 
     smooth_window = 50  # Rolling average for cleaner plots
@@ -703,16 +806,26 @@ def main():
 
     rng = np.random.default_rng(RANDOM_SEED)
 
+    # Quantize SINR_dB to 1 dB bins (V2 SIR jitter is per-MCS)
+    df["SINR_dB"] = df["SINR_dB"].round(0)
+
     # ---- 2. Build BLER lookup curves ----
     print("\n2. Building interpolated BLER curves (PHY abstraction) …")
     bler_lookup = BLERLookup(df)
 
     # ---- 3. Train offline GBM for agent use ----
     print("\n3. Training offline Ordinal GBM …")
+    # Detect V2 columns
+    has_v2 = "Num_Streams" in df.columns and "Carrier_GHz" in df.columns
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
+        ctx_cols = ["SINR_dB", "Channel", "Speed_kmph"]
+        if has_v2:
+            ctx_cols += ["Num_Streams", "Carrier_GHz"]
+
         stats = (
-            df.groupby(["SINR_dB", "Channel", "Speed_kmph", "MCS_Index"])
+            df.groupby(ctx_cols + ["MCS_Index"])
             .agg(BLER=("Was_Success", lambda x: 1.0 - x.mean()),
                  Throughput=("Actual_Throughput", "mean"),
                  N=("Was_Success", "count"))
@@ -726,8 +839,7 @@ def main():
             return g.loc[g["MCS_Index"].idxmin()]
 
         optimal = (
-            stats.groupby(["SINR_dB", "Channel", "Speed_kmph"],
-                          group_keys=False)
+            stats.groupby(ctx_cols, group_keys=False)
             .apply(get_optimal, include_groups=False)
             .reset_index()
         )
@@ -745,6 +857,14 @@ def main():
         CHANNEL_ORDINAL).fillna(1).astype(float)
 
     feature_cols = ["Measured_SINR", "Measured_Speed", "Channel_Ordinal"]
+    mono_cst = [1, -1, -1]
+
+    if has_v2:
+        optimal["Carrier_Band"] = (optimal["Carrier_GHz"] > 10.0).astype(float)
+        optimal["Num_Antennas"] = optimal["Num_Streams"].astype(float)
+        feature_cols += ["Carrier_Band", "Num_Antennas"]
+        mono_cst += [0, 0]
+
     X = optimal[feature_cols]
     y = optimal["MCS_Index"]
 
@@ -752,17 +872,47 @@ def main():
         mcs_indices=NR_MCS_INDICES,
         decision_threshold=0.5,
         max_iter=300, max_depth=4, min_samples_leaf=3,
-        learning_rate=0.1, monotonic_cst=[1, -1, -1],
+        learning_rate=0.1, monotonic_cst=mono_cst,
         random_state=RANDOM_SEED,
     )
     policy.fit(X, y)
     train_acc = accuracy_score(y, policy.predict(X))
-    print(f"   Training accuracy: {train_acc*100:.1f}%")
+    print(f"   GBM training accuracy: {train_acc*100:.1f}%")
+
+    # ---- 3b. Train DNN classifier for comparison ----
+    print("\n3b. Training DNN Classifier …")
+    mcs_to_idx = {mcs: i for i, mcs in enumerate(NR_MCS_INDICES)}
+    y_idx = y.map(mcs_to_idx).values
+
+    X_t = torch.FloatTensor(X.values)
+    y_t = torch.LongTensor(y_idx)
+    dataset = TensorDataset(X_t, y_t)
+    loader = DataLoader(dataset, batch_size=64, shuffle=True)
+
+    dnn_model = DNNClassifierNet(n_features=len(feature_cols),
+                                  n_classes=len(NR_MCS_INDICES))
+    optimizer = optim.Adam(dnn_model.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss()
+
+    dnn_model.train()
+    for epoch in range(100):
+        for bx, by in loader:
+            optimizer.zero_grad()
+            loss = criterion(dnn_model(bx), by)
+            loss.backward()
+            optimizer.step()
+
+    dnn_model.eval()
+    with torch.no_grad():
+        dnn_pred_idx = dnn_model(X_t).argmax(dim=1).numpy()
+    dnn_pred = np.array([NR_MCS_INDICES[i] for i in dnn_pred_idx])
+    dnn_acc = accuracy_score(y, dnn_pred)
+    print(f"   DNN training accuracy: {dnn_acc*100:.1f}%")
 
     # ---- 4. Run scenarios ----
     print("\n4. Running closed-loop scenarios …")
     all_scenarios = run_all_scenarios(
-        bler_lookup, policy, feature_cols, rng)
+        bler_lookup, policy, feature_cols, rng, dnn_model=dnn_model)
 
     # ---- 5. Results ----
     print("\n5. Results:")

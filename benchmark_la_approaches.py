@@ -68,7 +68,7 @@ NR_MCS_SE_MAP = {
     25: 8 * (616/1024),    # 256QAM R≈0.602 → SE≈4.813
 }
 
-CHANNEL_ORDINAL = {"TDL-A": 0, "TDL-B": 1, "TDL-C": 2}
+CHANNEL_ORDINAL = {"TDL-A": 0, "TDL-B": 1, "TDL-C": 2, "CDL-A": 3, "CDL-D": 4}
 
 
 # ============================================================================
@@ -77,8 +77,15 @@ CHANNEL_ORDINAL = {"TDL-A": 0, "TDL-B": 1, "TDL-C": 2}
 
 def build_optimal_label_table(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Aggregate packet logs → (context, MCS) stats → optimal MCS per context."""
+    # Base context dimensions
+    ctx_cols = ["SINR_dB", "Channel", "Speed_kmph"]
+    # Add V2 dimensions if present to avoid mixing SISO/MIMO or FR1/FR2
+    for col in ["Num_Streams", "Carrier_GHz"]:
+        if col in df.columns:
+            ctx_cols.append(col)
+
     stats = (
-        df.groupby(["SINR_dB", "Channel", "Speed_kmph", "MCS_Index"])
+        df.groupby(ctx_cols + ["MCS_Index"])
         .agg(
             BLER=("Was_Success", lambda x: 1.0 - x.mean()),
             Throughput=("Actual_Throughput", "mean"),
@@ -96,9 +103,7 @@ def build_optimal_label_table(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFr
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         optimal_df = (
-            stats.groupby(
-                ["SINR_dB", "Channel", "Speed_kmph"], group_keys=False,
-            )
+            stats.groupby(ctx_cols, group_keys=False)
             .apply(get_robust_optimal, include_groups=False)
             .reset_index()
         )
@@ -115,6 +120,11 @@ def add_features(optimal_df: pd.DataFrame, rng) -> pd.DataFrame:
     out["Measured_Speed"] = out["Speed_kmph"] + rng.normal(0.0, 10.0, len(out))
     out["Measured_Speed"] = out["Measured_Speed"].clip(lower=0.0)
     out["Channel_Ordinal"] = out["Channel"].map(CHANNEL_ORDINAL).astype(np.float64)
+    # V2 features (safe: columns already present from groupby propagation)
+    if "Num_Streams" in out.columns:
+        out["Num_Streams_feat"] = out["Num_Streams"].astype(float)
+    if "Carrier_GHz" in out.columns:
+        out["Carrier_GHz_feat"] = out["Carrier_GHz"].astype(float)
     return out
 
 
@@ -490,11 +500,16 @@ def shannon_bound_mcs(sinr_db_array: np.ndarray) -> np.ndarray:
 
 def evaluate_policy(eval_df, pred_mcs, stats_table):
     """Throughput + BLER violation rate from packet-level lookup."""
-    joined = eval_df[["SINR_dB", "Channel", "Speed_kmph"]].copy()
+    merge_cols = ["SINR_dB", "Channel", "Speed_kmph"]
+    for col in ["Num_Streams", "Carrier_GHz"]:
+        if col in eval_df.columns and col in stats_table.columns:
+            merge_cols.append(col)
+
+    joined = eval_df[merge_cols].copy()
     joined["MCS_Index"] = pred_mcs
     joined = joined.merge(
         stats_table,
-        on=["SINR_dB", "Channel", "Speed_kmph", "MCS_Index"],
+        on=merge_cols + ["MCS_Index"],
         how="left",
     )
     mean_thr = joined["Throughput"].mean()
@@ -545,6 +560,11 @@ def run_single_seed(df, seed, feature_cols):
         optimal_df["Channel"].astype(str)
         + "_" + optimal_df["Speed_kmph"].astype(str)
     )
+    # Richer groups for V2 to prevent data leakage across configs
+    if "Num_Streams" in optimal_df.columns:
+        groups = groups + "_" + optimal_df["Num_Streams"].astype(str)
+    if "Carrier_GHz" in optimal_df.columns:
+        groups = groups + "_" + optimal_df["Carrier_GHz"].astype(str)
     splitter = GroupShuffleSplit(
         n_splits=1, test_size=0.25, random_state=seed,
     )
@@ -621,6 +641,11 @@ def run_single_seed(df, seed, feature_cols):
     )
 
     # --- 3. Ordinal GBM (our method) ---
+    mono_map = {
+        "Measured_SINR": 1, "Measured_Speed": -1, "Channel_Ordinal": -1,
+        "Num_Streams_feat": 0, "Carrier_GHz_feat": 0,
+    }
+    mono_cst = [mono_map.get(c, 0) for c in feature_cols]
     policy = OrdinalMCSPolicy(
         mcs_indices=NR_MCS_INDICES,
         decision_threshold=0.5,
@@ -628,7 +653,7 @@ def run_single_seed(df, seed, feature_cols):
         max_depth=4,
         min_samples_leaf=3,
         learning_rate=0.1,
-        monotonic_cst=[1, -1, -1],
+        monotonic_cst=mono_cst,
         random_state=seed,
     )
     policy.fit(X_train, y_train)
@@ -873,16 +898,33 @@ def generate_plots(all_results, all_oracles, agg):
 # ============================================================================
 
 def main():
+    import os
     print("=" * 60)
     print("  Link Adaptation Benchmark Suite — V2")
     print("  Paper DNN / DNN Clf / GRU / Ordinal GBM / Shannon")
     print("=" * 60)
 
     print("\n1. Loading packet-level dataset…")
-    df = pd.read_csv("sionna_realistic_dataset.csv")
-    print(f"   {len(df):,} rows loaded.")
+    # Auto-detect V2 dataset
+    if os.path.exists("sionna_v2_dataset.csv"):
+        df = pd.read_csv("sionna_v2_dataset.csv")
+        is_v2 = True
+        print(f"   {len(df):,} rows loaded (V2: MIMO+FR2+CDL).")
+    else:
+        df = pd.read_csv("sionna_realistic_dataset.csv")
+        is_v2 = False
+        print(f"   {len(df):,} rows loaded (V1).")
+
+    # Quantize SINR_dB to 1 dB bins (same reason as train script —
+    # V2 SIR jitter is per-MCS, making each SINR unique)
+    df["SINR_dB"] = df["SINR_dB"].round(0)
 
     feature_cols = ["Measured_SINR", "Measured_Speed", "Channel_Ordinal"]
+    if is_v2:
+        # Add V2 features for richer models
+        df["Num_Streams_feat"] = df.get("Num_Streams", 1).astype(float)
+        df["Carrier_GHz_feat"] = df.get("Carrier_GHz", 3.5).astype(float)
+        feature_cols += ["Num_Streams_feat", "Carrier_GHz_feat"]
 
     print(f"\n2. Running {N_BOOTSTRAP_SEEDS} seeds for 95% CI…")
     all_results = []

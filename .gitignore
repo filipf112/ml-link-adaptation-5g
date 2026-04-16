@@ -30,7 +30,10 @@ venv/
 env/
 ENV/
 
-# Project specifics
+# Project specifics — large data and generated artifacts
 *.csv
 *.png
 la_policy_exported.cpp
+
+# Compiled C++ test binaries
+test_ml_la
