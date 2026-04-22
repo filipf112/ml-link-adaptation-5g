@@ -37,16 +37,33 @@ ml-link-adaptation-5g/
 ├── benchmark_la_approaches.py      # Offline benchmarking: AI vs OLLA vs Oracle
 ├── online_la_simulator.py          # Online closed-loop LA simulation with HARQ feedback
 ├── test_ml_link_adaptation.cpp     # C++ unit test for the exported decision tree
+├── srsran_integration/             # Live 5G NR deployment (see below)
+│   ├── scheduler/                  # Modified srsRAN gNB scheduler source
+│   ├── configs/                    # gNB and UE ZMQ configuration files
+│   └── docker/                     # Open5GS 5G Core container setup
 └── README.md
 ```
 
+## IV. Live 5G NR Deployment
 
-## IV. Prerequisites and Dependencies
+The distilled decision tree is deployed into the **srsRAN Project** gNB MAC scheduler, replacing the standard CQI-to-MCS mapping. The system runs as a full 5G SA stack over ZeroMQ virtual radio:
+
+- **gNB** (srsRAN Project) — ML-augmented DL scheduler with OLLA safety fallback
+- **UE** (srsRAN 4G / srsUE) — standard 5G NR Release 15 UE
+- **5G Core** (Open5GS) — containerized AMF/SMF/UPF
+
+See [`srsran_integration/README.md`](srsran_integration/README.md) for build instructions and file placement.
+
+## V. Prerequisites and Dependencies
 
 - Python 3.10+
 - TensorFlow 2.14+ (for Sionna hardware acceleration)
 - scikit-learn >= 1.3
 - GCC/Clang (Supporting C++17)
+- srsRAN Project + srsRAN 4G (for live deployment)
+- Docker & Docker Compose (for Open5GS 5G Core)
+- ZeroMQ (`libzmq3-dev`)
 
 ---
 *Developed for the academic course: Decision Support Algorithms (Algorytmy Wspomagania Decyzji).*
+

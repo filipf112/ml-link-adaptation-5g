@@ -1,0 +1,44 @@
+# srsRAN_Project ZMQ Configuration for ML Link Adaptation
+
+cu_cp:
+  amf:
+    addr: 10.153.1.2                 # Pointing to Open5GS directly via Docker bridge
+    bind_addr: 10.153.1.1            # Host IP on the bridge            
+    supported_tracking_areas:
+      - tac: 7
+        plmn_list:
+          - plmn: "00101"
+            tai_slice_support_list:
+              - sst: 1
+
+ru_sdr:
+  device_driver: zmq
+  device_args: tx_port=tcp://127.0.0.1:2000,rx_port=tcp://127.0.0.1:2001,base_srate=23.04e6
+  srate: 23.04
+  tx_gain: 75
+  rx_gain: 75
+
+cell_cfg:
+  dl_arfcn: 368500                  
+  band: 3
+  channel_bandwidth_MHz: 20
+  common_scs: 15                    
+  plmn: "00101"
+  tac: 7
+  pdcch:
+    common:
+      ss0_index: 0
+      coreset0_index: 12
+    dedicated:
+      ss2_type: common
+      dci_format_0_1_and_1_1: false
+  prach:
+    prach_config_index: 1
+  pdsch:
+    mcs_table: qam64
+  pusch:
+    mcs_table: qam64
+
+log:
+  filename: stdout
+  all_level: info
