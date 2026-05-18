@@ -1,4 +1,4 @@
-# Byte-compiled / optimized / DLL files
+# Byte-compiled / optimized
 __pycache__/
 *.py[cod]
 *$py.class
@@ -9,31 +9,22 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
 *.egg
 
 # Virtual environments
 venv/
 .env
 env/
-ENV/
 
 # Project specifics — large data and generated artifacts
 *.csv
 *.png
 la_policy_exported.cpp
+
+# Allow result plots to be committed
+!results/*.png
 
 # Compiled C++ test binaries
 test_ml_la
